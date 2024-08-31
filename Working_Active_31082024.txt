@@ -1,0 +1,1786 @@
+/*#include <HTTP_Method.h> // Normal without active inactive status
+#include <Uri.h>
+#include <WebServer.h>
+#include <Wire.h>
+#include <WiFi.h>
+#include <SPI.h>
+#include <WiFiClientSecure.h>
+#include <MQTTClient.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+#include "certss.h"
+#include <Adafruit_Sensor.h>
+#include "Adafruit_MLX90614.h"
+//#include "MAX30105.h" // Commenting out the MAX30105 header
+#include <NTPClient.h>
+#include <WiFiUdp.h>
+#include <TimeLib.h>
+#include <DHT.h>
+#include <DHT_U.h>
+#include <Multichannel_Gas_GMXXX.h>
+
+#define RXD2 16 // Define RXD2 pin
+#define TXD2 17 // Define TXD2 pin
+#define ID "01"
+#define LED_PIN 2 // LED pin definition
+
+// Define I2C addresses for each device
+#define GAS_SENSOR_ADDRESS 0x08
+#define MLX_SENSOR_ADDRESS 0x5A
+//#define MAX_SENSOR_ADDRESS 0x57 // Commenting out the address for MAX30105
+
+// MAX30105 particleSensor; // Commenting out the initialization of MAX30105
+GAS_GMXXX<TwoWire> gasSensor;
+Adafruit_MLX90614 mlx = Adafruit_MLX90614();
+#define DHTPIN 1
+#define DHTTYPE DHT22
+DHT dht(DHTPIN, DHTTYPE);
+
+unsigned long ledStartTime = 0;
+#define THINGNAME "Smart_Helmet"
+const char ssid[] = "me";
+const char password[] = "12345678";
+const char AWS_IOT_ENDPOINT[] ="a27mqcf3cydka7-ats.iot.us-east-1.amazonaws.com";
+
+#define AWS_IOT_PUBLISH_TOPIC "smart01/pub"
+#define AWS_IOT_SUBSCRIBE_TOPIC "smart01/sub"
+
+WiFiClientSecure wifi_client;
+MQTTClient mqtt_client(256);
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "pool.ntp.org", 19800, 60000); // Offset for IST
+uint32_t t1;
+
+
+float calculateHeartRate(uint32_t irValue) {
+    return irValue / 1000.0;
+}
+
+
+bool checkSensors() {
+    bool allSensorsWorking = true;
+
+    // DHT22 Sensor Check
+    if (isnan(dht.readTemperature())) {
+        Serial.println("DHT22 Sensor Error");
+        allSensorsWorking = false;
+    }
+
+    
+    // MAX30105 Sensor Check (Heart Rate)
+    uint32_t irValue = particleSensor.getIR();
+    if (irValue < 50000) {
+        Serial.println("MAX30105 Sensor Error");
+        allSensorsWorking = false;
+    } else if (irValue == 0) {
+        // Default value should be 1 if the sensor is active
+        irValue = 1;
+    }
+    
+
+    // MLX90614 Sensor Check
+    if (isnan(mlx.readObjectTempC())) {
+        Serial.println("MLX90614 Sensor Error");
+        allSensorsWorking = false;
+    }
+
+    // Multichannel Gas Sensor Check
+    if (gasSensor.getGM502B() == 0 && gasSensor.getGM702B() == 0 && gasSensor.getGM102B() == 0 && gasSensor.getGM302B() == 0) {
+        Serial.println("Multichannel Gas Sensor Error");
+        allSensorsWorking = false;
+    }
+
+    return allSensorsWorking;
+}
+
+void connectAWS() {
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ssid, password);
+    Serial.println("Connecting to Wi-Fi");
+    int wifi_attempts = 0;
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
+        wifi_attempts++;
+        if (wifi_attempts > 60) {
+            Serial.println("Failed to connect to Wi-Fi");
+            return;
+        }
+    }
+    Serial.println();
+    Serial.print("Connected to Wi-Fi. IP address: ");
+    Serial.println(WiFi.localIP());
+
+    wifi_client.setCACert(AWS_CERT_CA);
+    wifi_client.setCertificate(AWS_CERT_CRT);
+    wifi_client.setPrivateKey(AWS_CERT_PRIVATE);
+
+    mqtt_client.begin(AWS_IOT_ENDPOINT, 8883, wifi_client);
+    mqtt_client.onMessage(incomingMessageHandler);
+
+    Serial.print("Connecting to AWS IOT");
+    while (!mqtt_client.connect(THINGNAME)) {
+        Serial.print(".");
+        delay(100);
+    }
+    Serial.println();
+    if (!mqtt_client.connected()) {
+        Serial.println("AWS IoT Timeout!");
+        return;
+    }
+    mqtt_client.subscribe(AWS_IOT_SUBSCRIBE_TOPIC);
+    Serial.println("AWS IoT Connected!");
+
+    timeClient.begin();
+    timeClient.update();
+    setTime(timeClient.getEpochTime());
+}
+
+void publishMessage() {
+    DynamicJsonDocument doc(512);
+
+    int objTemp = mlx.readObjectTempC();
+    // uint32_t irValue = particleSensor.getIR(); // Commenting out IR value reading
+    // int heartRate = calculateHeartRate(irValue); // Commenting out heart rate calculation
+    unsigned int voc = gasSensor.getGM502B();
+    unsigned int co = gasSensor.getGM702B();
+    unsigned int no2 = gasSensor.getGM102B();
+    unsigned int c2h5ch = gasSensor.getGM302B();
+    int t = dht.readTemperature(); 
+
+    doc["Env_temp"] = t;
+    doc["Obj_temp"] = isnan(objTemp) ? 0 : objTemp;
+    // doc["Hrt"] = heartRate; // Commenting out heart rate data
+    doc["VOLATILE_GAS"] = voc;
+    doc["CARBON_MONOXIDE"] = co;
+    doc["NITROGEN_DIOXIDE"] = no2;
+    doc["ALCOHOL"] = c2h5ch;
+    doc["time"] = millis() - t1;
+    doc["Device_ID"] = ID;
+
+    char dateTime[20];
+    sprintf(dateTime, "%04d-%02d-%02d %02d:%02d:%02d", year(), month(), day(), hour(), minute(), second());
+    doc["datetime"] = dateTime;
+
+    // Determine Helmet Status
+    if (checkSensors()) {
+        doc["Helmet_Status"] = "Active";
+        Serial.println("Helmet is Active");
+    } else {
+        doc["Helmet_Status"] = "Inactive";
+        Serial.println("Helmet is Inactive");
+    }
+
+    String jsonString;
+    serializeJson(doc, jsonString);
+    mqtt_client.publish(AWS_IOT_PUBLISH_TOPIC, jsonString.c_str());
+    Serial.println("Sent a message: " + jsonString);
+}
+
+void incomingMessageHandler(String &topic, String &payload) {
+    Serial.println("Message received!");
+    Serial.println("Topic: " + topic);
+    Serial.println("Payload: " + payload);
+
+    DynamicJsonDocument doc(512);
+    deserializeJson(doc, payload);
+
+    if (doc.containsKey("LED")) {
+        bool ledState = doc["LED"];
+        
+        if (ledState) {
+            digitalWrite(LED_PIN, HIGH);
+            ledStartTime = millis();
+            Serial.println("LED is now ON");
+        } else {
+            digitalWrite(LED_PIN, LOW);
+            Serial.println("LED is now OFF");
+        }
+    }
+}
+
+void setup() {
+    Serial.begin(9600);
+    pinMode(LED_PIN, OUTPUT);
+    digitalWrite(LED_PIN, LOW);
+    t1 = millis();
+    dht.begin();
+    Serial.println("Setup started");
+
+    Wire.begin();
+
+    gasSensor.begin(Wire, GAS_SENSOR_ADDRESS);
+    mlx.begin(MLX_SENSOR_ADDRESS);
+    // particleSensor.begin(Wire); // Commenting out particle sensor initialization
+    // particleSensor.setup(); // Commenting out particle sensor setup
+    // particleSensor.setPulseAmplitudeRed(0x0A); // Commenting out pulse amplitude setting
+
+    Serial.println("Setup complete");
+
+    connectAWS();
+}
+
+void loop() {
+    if (digitalRead(LED_PIN) == HIGH && millis() - ledStartTime > 5000) {
+        digitalWrite(LED_PIN, LOW);
+        Serial.println("LED turned OFF automatically after 5 seconds");
+    }
+
+    publishMessage();
+    mqtt_client.loop();
+    delay(4000);
+}
+
+
+
+
+
+
+
+
+
+
+
+/*
+
+#include <HTTP_Method.h>
+#include <Uri.h>
+#include <WebServer.h>
+#include <Wire.h>
+#include <WiFi.h>
+#include <SPI.h>
+#include <WiFiClientSecure.h>
+#include <MQTTClient.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+#include "certss.h"
+#include <Adafruit_Sensor.h>
+#include "Adafruit_MLX90614.h"
+#include "MAX30105.h" // Uncommenting the MAX30105 header
+#include <NTPClient.h>
+#include <WiFiUdp.h>
+#include <TimeLib.h>
+#include <DHT.h>
+#include <DHT_U.h>
+#include <Multichannel_Gas_GMXXX.h>
+
+#define RXD2 16
+#define TXD2 17
+#define ID "01"
+#define LED_PIN 2
+
+#define GAS_SENSOR_ADDRESS 0x08
+#define MLX_SENSOR_ADDRESS 0x5A
+#define MAX_SENSOR_ADDRESS 0x57 // Uncommenting the address for MAX30105
+
+MAX30105 particleSensor; // Uncommenting the initialization of MAX30105
+GAS_GMXXX<TwoWire> gasSensor;
+Adafruit_MLX90614 mlx = Adafruit_MLX90614();
+#define DHTPIN 1
+#define DHTTYPE DHT22
+DHT dht(DHTPIN, DHTTYPE);
+
+unsigned long ledStartTime = 0;
+#define THINGNAME "Smart_Helmet"
+const char ssid[] = "me";
+const char password[] = "12345678";
+const char AWS_IOT_ENDPOINT[] ="a27mqcf3cydka7-ats.iot.us-east-1.amazonaws.com";
+
+#define AWS_IOT_PUBLISH_TOPIC "smart01/pub"
+#define AWS_IOT_SUBSCRIBE_TOPIC "smart01/sub"
+
+WiFiClientSecure wifi_client;
+MQTTClient mqtt_client(256);
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "pool.ntp.org", 19800, 60000);
+uint32_t t1;
+
+float calculateHeartRate(uint32_t irValue) {
+    if (irValue < 50000) {
+        return 68; // Default heart rate value when the sensor is inactive
+    }
+    return irValue / 1000.0;
+}
+
+bool checkSensors() {
+    bool allSensorsWorking = true;
+
+    // DHT22 Sensor Check
+    if (isnan(dht.readTemperature())) {
+        Serial.println("DHT22 Sensor Error");
+        allSensorsWorking = false;
+    }
+
+    // MAX30105 Sensor Check (Heart Rate)
+    uint32_t irValue = particleSensor.getIR();
+    if (irValue < 50000) {
+        Serial.println("MAX30105 Sensor Error");
+        allSensorsWorking = false;
+    }
+
+    // MLX90614 Sensor Check
+    if (isnan(mlx.readObjectTempC())) {
+        Serial.println("MLX90614 Sensor Error");
+        allSensorsWorking = false;
+    }
+
+    // Multichannel Gas Sensor Check
+    if (gasSensor.getGM502B() == 0 && gasSensor.getGM702B() == 0 && gasSensor.getGM102B() == 0 && gasSensor.getGM302B() == 0) {
+        Serial.println("Multichannel Gas Sensor Error");
+        allSensorsWorking = false;
+    }
+
+    return allSensorsWorking;
+}
+
+void connectAWS() {
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ssid, password);
+    Serial.println("Connecting to Wi-Fi");
+    int wifi_attempts = 0;
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
+        wifi_attempts++;
+        if (wifi_attempts > 60) {
+            Serial.println("Failed to connect to Wi-Fi");
+            return;
+        }
+    }
+    Serial.println();
+    Serial.print("Connected to Wi-Fi. IP address: ");
+    Serial.println(WiFi.localIP());
+
+    wifi_client.setCACert(AWS_CERT_CA);
+    wifi_client.setCertificate(AWS_CERT_CRT);
+    wifi_client.setPrivateKey(AWS_CERT_PRIVATE);
+
+    mqtt_client.begin(AWS_IOT_ENDPOINT, 8883, wifi_client);
+    mqtt_client.onMessage(incomingMessageHandler);
+
+    Serial.print("Connecting to AWS IOT");
+    while (!mqtt_client.connect(THINGNAME)) {
+        Serial.print(".");
+        delay(100);
+    }
+    Serial.println();
+    if (!mqtt_client.connected()) {
+        Serial.println("AWS IoT Timeout!");
+        return;
+    }
+    mqtt_client.subscribe(AWS_IOT_SUBSCRIBE_TOPIC);
+    Serial.println("AWS IoT Connected!");
+
+    timeClient.begin();
+    timeClient.update();
+    setTime(timeClient.getEpochTime());
+}
+
+void publishMessage() {
+    DynamicJsonDocument doc(512);
+
+    int objTemp = mlx.readObjectTempC();
+    uint32_t irValue = particleSensor.getIR(); 
+    int heartRate = calculateHeartRate(irValue);
+    unsigned int voc = gasSensor.getGM502B();
+    unsigned int co = gasSensor.getGM702B();
+    unsigned int no2 = gasSensor.getGM102B();
+    unsigned int c2h5ch = gasSensor.getGM302B();
+    int t = dht.readTemperature(); 
+
+    doc["Env_temp"] = t;
+    doc["Obj_temp"] = isnan(objTemp) ? 0 : objTemp;
+    doc["Hrt"] = heartRate; // Including heart rate data
+    doc["VOLATILE_GAS"] = voc;
+    doc["CARBON_MONOXIDE"] = co;
+    doc["NITROGEN_DIOXIDE"] = no2;
+    doc["ALCOHOL"] = c2h5ch;
+    doc["time"] = millis() - t1;
+    doc["Device_ID"] = ID;
+
+    char dateTime[20];
+    sprintf(dateTime, "%04d-%02d-%02d %02d:%02d:%02d", year(), month(), day(), hour(), minute(), second());
+    doc["datetime"] = dateTime;
+
+    if (checkSensors()) {
+        doc["Helmet_Status"] = "Active";
+        Serial.println("Helmet is Active");
+    } else {
+        doc["Helmet_Status"] = "Inactive";
+        Serial.println("Helmet is Active");
+    }
+
+    String jsonString;
+    serializeJson(doc, jsonString);
+    mqtt_client.publish(AWS_IOT_PUBLISH_TOPIC, jsonString.c_str());
+    Serial.println("Sent a message: " + jsonString);
+}
+
+void incomingMessageHandler(String &topic, String &payload) {
+    Serial.println("Message received!");
+    Serial.println("Topic: " + topic);
+    Serial.println("Payload: " + payload);
+
+    DynamicJsonDocument doc(512);
+    deserializeJson(doc, payload);
+
+    if (doc.containsKey("LED")) {
+        bool ledState = doc["LED"];
+        
+        if (ledState) {
+            digitalWrite(LED_PIN, HIGH);
+            ledStartTime = millis();
+            Serial.println("LED is now ON");
+        } else {
+            digitalWrite(LED_PIN, LOW);
+            Serial.println("LED is now OFF");
+        }
+    }
+}
+
+void setup() {
+    Serial.begin(9600);
+    pinMode(LED_PIN, OUTPUT);
+    digitalWrite(LED_PIN, LOW);
+    t1 = millis();
+    dht.begin();
+    Serial.println("Setup started");
+
+    Wire.begin();
+
+    gasSensor.begin(Wire, GAS_SENSOR_ADDRESS);
+    mlx.begin(MLX_SENSOR_ADDRESS);
+    particleSensor.begin(Wire); // Uncommenting particle sensor initialization
+    particleSensor.setup(); // Uncommenting particle sensor setup
+    particleSensor.setPulseAmplitudeRed(0x0A); // Uncommenting pulse amplitude setting
+
+    Serial.println("Setup complete");
+
+    connectAWS();
+}
+
+void loop() {
+    if (digitalRead(LED_PIN) == HIGH && millis() - ledStartTime > 5000) {
+        digitalWrite(LED_PIN, LOW);
+        Serial.println("LED turned OFF automatically after 5 seconds");
+    }
+
+    publishMessage();
+    mqtt_client.loop();
+    delay(4000);
+}
+
+
+
+
+
+
+
+
+
+
+
+
+#include <HTTP_Method.h>
+#include <Uri.h>
+#include <WebServer.h>
+#include <Wire.h>
+#include <WiFi.h>
+#include <SPI.h>
+#include <WiFiClientSecure.h>
+#include <MQTTClient.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+#include "certss.h"
+#include <Adafruit_Sensor.h>
+#include "Adafruit_MLX90614.h"
+#include "MAX30105.h" // Uncommenting the MAX30105 header
+#include <NTPClient.h>
+#include <WiFiUdp.h>
+#include <TimeLib.h>
+#include <DHT.h>
+#include <DHT_U.h>
+#include <Multichannel_Gas_GMXXX.h>
+
+#define RXD2 16
+#define TXD2 17
+#define ID "01"
+#define LED_PIN 2
+
+#define GAS_SENSOR_ADDRESS 0x08
+#define MLX_SENSOR_ADDRESS 0x5A
+#define MAX_SENSOR_ADDRESS 0x57 // Uncommenting the address for MAX30105
+
+MAX30105 particleSensor; // Uncommenting the initialization of MAX30105
+GAS_GMXXX<TwoWire> gasSensor;
+Adafruit_MLX90614 mlx = Adafruit_MLX90614();
+#define DHTPIN 1
+#define DHTTYPE DHT22
+DHT dht(DHTPIN, DHTTYPE);
+
+unsigned long ledStartTime = 0;
+#define THINGNAME "Smart_Helmet"
+const char ssid[] = "me";
+const char password[] = "12345678";
+const char AWS_IOT_ENDPOINT[] ="a27mqcf3cydka7-ats.iot.us-east-1.amazonaws.com";
+
+#define AWS_IOT_PUBLISH_TOPIC "smart01/pub"
+#define AWS_IOT_SUBSCRIBE_TOPIC "smart01/sub"
+
+WiFiClientSecure wifi_client;
+MQTTClient mqtt_client(256);
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "pool.ntp.org", 19800, 60000);
+uint32_t t1;
+
+float calculateHeartRate(uint32_t irValue) {
+    if (irValue < 50000) {
+        return 68; // Default heart rate value when the sensor is inactive
+    }
+    return irValue / 1000.0;
+}
+
+bool checkSensors() {
+    bool allSensorsWorking = true;
+
+    // DHT22 Sensor Check
+    if (isnan(dht.readTemperature())) {
+        Serial.println("DHT22 Sensor Error");
+        allSensorsWorking = false;
+    }
+
+    // MAX30105 Sensor Check (Heart Rate)
+    uint32_t irValue = particleSensor.getIR();
+    if (irValue < 50000) {
+        Serial.println("MAX30105 Sensor Error");
+        allSensorsWorking = false;
+    }
+
+    // MLX90614 Sensor Check
+    if (isnan(mlx.readObjectTempC())) {
+        Serial.println("MLX90614 Sensor Error");
+        allSensorsWorking = false;
+    }
+
+    // Multichannel Gas Sensor Check
+    if (gasSensor.getGM502B() == 0 && gasSensor.getGM702B() == 0 && gasSensor.getGM102B() == 0 && gasSensor.getGM302B() == 0) {
+        Serial.println("Multichannel Gas Sensor Error");
+        allSensorsWorking = false;
+    }
+
+    return allSensorsWorking;
+}
+
+void connectAWS() {
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ssid, password);
+    Serial.println("Connecting to Wi-Fi");
+    int wifi_attempts = 0;
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
+        wifi_attempts++;
+        if (wifi_attempts > 60) {
+            Serial.println("Failed to connect to Wi-Fi");
+            return;
+        }
+    }
+    Serial.println();
+    Serial.print("Connected to Wi-Fi. IP address: ");
+    Serial.println(WiFi.localIP());
+
+    wifi_client.setCACert(AWS_CERT_CA);
+    wifi_client.setCertificate(AWS_CERT_CRT);
+    wifi_client.setPrivateKey(AWS_CERT_PRIVATE);
+
+    mqtt_client.begin(AWS_IOT_ENDPOINT, 8883, wifi_client);
+    mqtt_client.onMessage(incomingMessageHandler);
+
+    Serial.print("Connecting to AWS IOT");
+    while (!mqtt_client.connect(THINGNAME)) {
+        Serial.print(".");
+        delay(100);
+    }
+    Serial.println();
+    if (!mqtt_client.connected()) {
+        Serial.println("AWS IoT Timeout!");
+        return;
+    }
+    mqtt_client.subscribe(AWS_IOT_SUBSCRIBE_TOPIC);
+    Serial.println("AWS IoT Connected!");
+
+    timeClient.begin();
+    timeClient.update();
+    setTime(timeClient.getEpochTime());
+}
+
+void publishMessage() {
+    DynamicJsonDocument doc(512);
+
+    int objTemp = mlx.readObjectTempC();
+    uint32_t irValue = particleSensor.getIR(); 
+    int heartRate = calculateHeartRate(irValue);
+    unsigned int voc = gasSensor.getGM502B();
+    unsigned int co = gasSensor.getGM702B();
+    unsigned int no2 = gasSensor.getGM102B();
+    unsigned int c2h5ch = gasSensor.getGM302B();
+    int t = dht.readTemperature(); 
+
+    doc["Env_temp"] = t;
+    doc["Obj_temp"] = isnan(objTemp) ? 0 : objTemp;
+    doc["Hrt"] = heartRate; // Including heart rate data
+    doc["VOLATILE_GAS"] = voc;
+    doc["CARBON_MONOXIDE"] = co;
+    doc["NITROGEN_DIOXIDE"] = no2;
+    doc["ALCOHOL"] = c2h5ch;
+    doc["time"] = millis() - t1;
+    doc["Device_ID"] = ID;
+
+    char dateTime[20];
+    sprintf(dateTime, "%04d-%02d-%02d %02d:%02d:%02d", year(), month(), day(), hour(), minute(), second());
+    doc["datetime"] = dateTime;
+
+    if (checkSensors()) {
+        doc["Helmet_Status"] = "Active";
+        Serial.println("Helmet is Active");
+    } else {
+        doc["Helmet_Status"] = "Inactive";
+        Serial.println("Helmet is Inactive");
+    }
+
+    String jsonString;
+    serializeJson(doc, jsonString);
+    mqtt_client.publish(AWS_IOT_PUBLISH_TOPIC, jsonString.c_str());
+    Serial.println("Sent a message: " + jsonString);
+}
+
+void incomingMessageHandler(String &topic, String &payload) {
+    Serial.println("Message received!");
+    Serial.println("Topic: " + topic);
+    Serial.println("Payload: " + payload);
+
+    DynamicJsonDocument doc(512);
+    deserializeJson(doc, payload);
+
+    if (doc.containsKey("LED")) {
+        bool ledState = doc["LED"];
+        
+        if (ledState) {
+            digitalWrite(LED_PIN, HIGH);
+            ledStartTime = millis();
+            Serial.println("LED is now ON");
+        } else {
+            digitalWrite(LED_PIN, LOW);
+            Serial.println("LED is now OFF");
+        }
+    }
+}
+
+void setup() {
+    Serial.begin(9600);
+    pinMode(LED_PIN, OUTPUT);
+    digitalWrite(LED_PIN, LOW);
+    t1 = millis();
+    dht.begin();
+    Serial.println("Setup started");
+
+    Wire.begin();
+
+    gasSensor.begin(Wire, GAS_SENSOR_ADDRESS);
+    mlx.begin(MLX_SENSOR_ADDRESS);
+    particleSensor.begin(Wire); // Uncommenting particle sensor initialization
+    particleSensor.setup(); // Uncommenting particle sensor setup
+    particleSensor.setPulseAmplitudeRed(0x0A); // Uncommenting pulse amplitude setting
+
+    Serial.println("Setup complete");
+
+    connectAWS();
+}
+
+void loop() {
+    if (digitalRead(LED_PIN) == HIGH && millis() - ledStartTime > 5000) {
+        digitalWrite(LED_PIN, LOW);
+        Serial.println("LED turned OFF automatically after 5 seconds");
+    }
+
+    publishMessage();
+    mqtt_client.loop();
+    delay(4000);
+}
+
+
+#include <HTTP_Method.h>
+#include <Uri.h>
+#include <WebServer.h>
+#include <Wire.h>
+#include <WiFi.h>
+#include <SPI.h>
+#include <WiFiClientSecure.h>
+#include <MQTTClient.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+#include "certss.h"
+#include <Adafruit_Sensor.h>
+#include "Adafruit_MLX90614.h"
+#include "MAX30105.h" // Uncommenting the MAX30105 header
+#include <NTPClient.h>
+#include <WiFiUdp.h>
+#include <TimeLib.h>
+#include <DHT.h>
+#include <DHT_U.h>
+#include <Multichannel_Gas_GMXXX.h>
+
+#define RXD2 16
+#define TXD2 17
+#define ID "01"
+#define LED_PIN 2
+
+#define GAS_SENSOR_ADDRESS 0x08
+#define MLX_SENSOR_ADDRESS 0x5A
+#define MAX_SENSOR_ADDRESS 0x57 // Uncommenting the address for MAX30105
+
+MAX30105 particleSensor; // Uncommenting the initialization of MAX30105
+GAS_GMXXX<TwoWire> gasSensor;
+Adafruit_MLX90614 mlx = Adafruit_MLX90614();
+#define DHTPIN 1
+#define DHTTYPE DHT22
+DHT dht(DHTPIN, DHTTYPE);
+
+unsigned long ledStartTime = 0;
+#define THINGNAME "Smart_Helmet"
+const char ssid[] = "me";
+const char password[] = "12345678";
+const char AWS_IOT_ENDPOINT[] ="a27mqcf3cydka7-ats.iot.us-east-1.amazonaws.com";
+
+#define AWS_IOT_PUBLISH_TOPIC "smart01/pub"
+#define AWS_IOT_SUBSCRIBE_TOPIC "smart01/sub"
+
+WiFiClientSecure wifi_client;
+MQTTClient mqtt_client(256);
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "pool.ntp.org", 19800, 60000);
+uint32_t t1;
+
+float calculateHeartRate(uint32_t irValue) {
+    if (irValue < 50000) {
+        return 1; // Default heart rate value when the sensor is inactive
+    }
+    return irValue / 1000.0;
+}
+
+bool checkSensors() {
+    bool allSensorsWorking = true;
+
+    // DHT22 Sensor Check
+    if (isnan(dht.readTemperature())) {
+        Serial.println("DHT22 Sensor Error");
+        allSensorsWorking = false;
+    }
+
+    // MAX30105 Sensor Check (Heart Rate)
+    uint32_t irValue = particleSensor.getIR();
+    if (irValue < 50000) {
+        Serial.println("MAX30105 Sensor Error");
+        allSensorsWorking = false;
+    }
+
+    // MLX90614 Sensor Check
+    if (isnan(mlx.readObjectTempC())) {
+        Serial.println("MLX90614 Sensor Error");
+        allSensorsWorking = false;
+    }
+
+    // Multichannel Gas Sensor Check
+    if (gasSensor.getGM502B() == 0 && gasSensor.getGM702B() == 0 && gasSensor.getGM102B() == 0 && gasSensor.getGM302B() == 0) {
+        Serial.println("Multichannel Gas Sensor Error");
+        allSensorsWorking = false;
+    }
+
+    return allSensorsWorking;
+}
+
+void connectAWS() {
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ssid, password);
+    Serial.println("Connecting to Wi-Fi");
+    int wifi_attempts = 0;
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
+        wifi_attempts++;
+        if (wifi_attempts > 60) {
+            Serial.println("Failed to connect to Wi-Fi");
+            return;
+        }
+    }
+    Serial.println();
+    Serial.print("Connected to Wi-Fi. IP address: ");
+    Serial.println(WiFi.localIP());
+
+    wifi_client.setCACert(AWS_CERT_CA);
+    wifi_client.setCertificate(AWS_CERT_CRT);
+    wifi_client.setPrivateKey(AWS_CERT_PRIVATE);
+
+    mqtt_client.begin(AWS_IOT_ENDPOINT, 8883, wifi_client);
+    mqtt_client.onMessage(incomingMessageHandler);
+
+    Serial.print("Connecting to AWS IOT");
+    while (!mqtt_client.connect(THINGNAME)) {
+        Serial.print(".");
+        delay(100);
+    }
+    Serial.println();
+    if (!mqtt_client.connected()) {
+        Serial.println("AWS IoT Timeout!");
+        return;
+    }
+    mqtt_client.subscribe(AWS_IOT_SUBSCRIBE_TOPIC);
+    Serial.println("AWS IoT Connected!");
+
+    timeClient.begin();
+    timeClient.update();
+    setTime(timeClient.getEpochTime());
+}
+
+void publishMessage() {
+    DynamicJsonDocument doc(512);
+
+    int objTemp = mlx.readObjectTempC();
+    uint32_t irValue = particleSensor.getIR(); 
+    int heartRate = calculateHeartRate(irValue);
+    unsigned int voc = gasSensor.getGM502B();
+    unsigned int co = gasSensor.getGM702B();
+    unsigned int no2 = gasSensor.getGM102B();
+    unsigned int c2h5ch = gasSensor.getGM302B();
+    int t = dht.readTemperature(); 
+
+    doc["Env_temp"] = t;
+    doc["Obj_temp"] = isnan(objTemp) ? 0 : objTemp;
+    doc["Hrt"] = heartRate; // Including heart rate data
+    doc["VOLATILE_GAS"] = voc;
+    doc["CARBON_MONOXIDE"] = co;
+    doc["NITROGEN_DIOXIDE"] = no2;
+    doc["ALCOHOL"] = c2h5ch;
+    doc["time"] = millis() - t1;
+    doc["Device_ID"] = ID;
+
+    char dateTime[20];
+    sprintf(dateTime, "%04d-%02d-%02d %02d:%02d:%02d", year(), month(), day(), hour(), minute(), second());
+    doc["datetime"] = dateTime;
+
+    if (checkSensors()) {
+        doc["Helmet_Status"] = "Active";
+        Serial.println("Helmet is Active");
+    } else {
+        doc["Helmet_Status"] = "Inactive";
+        Serial.println("Helmet is Inactive");
+    }
+
+    String jsonString;
+    serializeJson(doc, jsonString);
+    mqtt_client.publish(AWS_IOT_PUBLISH_TOPIC, jsonString.c_str());
+    Serial.println("Sent a message: " + jsonString);
+}
+
+void incomingMessageHandler(String &topic, String &payload) {
+    Serial.println("Message received!");
+    Serial.println("Topic: " + topic);
+    Serial.println("Payload: " + payload);
+
+    DynamicJsonDocument doc(512);
+    deserializeJson(doc, payload);
+
+    if (doc.containsKey("LED")) {
+        bool ledState = doc["LED"];
+        
+        if (ledState) {
+            digitalWrite(LED_PIN, HIGH);
+            ledStartTime = millis();
+            Serial.println("LED is now ON");
+        } else {
+            digitalWrite(LED_PIN, LOW);
+            Serial.println("LED is now OFF");
+        }
+    }
+}
+
+void setup() {
+    Serial.begin(9600);
+    pinMode(LED_PIN, OUTPUT);
+    digitalWrite(LED_PIN, LOW);
+    t1 = millis();
+    dht.begin();
+    Serial.println("Setup started");
+
+    Wire.begin();
+
+    gasSensor.begin(Wire, GAS_SENSOR_ADDRESS);
+    mlx.begin(MLX_SENSOR_ADDRESS);
+    particleSensor.begin(Wire); // Uncommenting particle sensor initialization
+    particleSensor.setup(); // Uncommenting particle sensor setup
+    particleSensor.setPulseAmplitudeRed(0x0A); // Uncommenting pulse amplitude setting
+
+    Serial.println("Setup complete");
+
+    connectAWS();
+}
+
+void loop() {
+    if (digitalRead(LED_PIN) == HIGH && millis() - ledStartTime > 5000) {
+        digitalWrite(LED_PIN, LOW);
+        Serial.println("LED turned OFF automatically after 5 seconds");
+    }
+
+    publishMessage();
+    mqtt_client.loop();
+    delay(4000);
+}
+
+
+
+
+
+
+
+
+
+
+
+
+#include <HTTP_Method.h>
+#include <Uri.h>
+#include <WebServer.h>
+#include <Wire.h>
+#include <WiFi.h>
+#include <SPI.h>
+#include <WiFiClientSecure.h>
+#include <MQTTClient.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+#include "certss.h"
+#include <Adafruit_Sensor.h>
+#include "Adafruit_MLX90614.h"
+#include "MAX30105.h" // Uncommenting the MAX30105 header
+#include <NTPClient.h>
+#include <WiFiUdp.h>
+#include <TimeLib.h>
+#include <DHT.h>
+#include <DHT_U.h>
+#include <Multichannel_Gas_GMXXX.h>
+
+#define RXD2 16
+#define TXD2 17
+#define ID "01"
+#define LED_PIN 2
+
+#define GAS_SENSOR_ADDRESS 0x08
+#define MLX_SENSOR_ADDRESS 0x5A
+#define MAX_SENSOR_ADDRESS 0x57 // Uncommenting the address for MAX30105
+
+MAX30105 particleSensor; // Uncommenting the initialization of MAX30105
+GAS_GMXXX<TwoWire> gasSensor;
+Adafruit_MLX90614 mlx = Adafruit_MLX90614();
+#define DHTPIN 1
+#define DHTTYPE DHT22
+DHT dht(DHTPIN, DHTTYPE);
+
+unsigned long ledStartTime = 0;
+#define THINGNAME "Smart_Helmet"
+const char ssid[] = "me";
+const char password[] = "12345678";
+const char AWS_IOT_ENDPOINT[] ="a27mqcf3cydka7-ats.iot.us-east-1.amazonaws.com";
+
+#define AWS_IOT_PUBLISH_TOPIC "smart01/pub"
+#define AWS_IOT_SUBSCRIBE_TOPIC "smart01/sub"
+
+WiFiClientSecure wifi_client;
+MQTTClient mqtt_client(256);
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "pool.ntp.org", 19800, 60000);
+uint32_t t1;
+
+float calculateHeartRate(uint32_t irValue) {
+    return irValue / 1000.0;
+}
+
+bool checkSensors() {
+    bool allSensorsWorking = true;
+
+    // DHT22 Sensor Check
+    if (isnan(dht.readTemperature())) {
+        Serial.println("DHT22 Sensor Error");
+        allSensorsWorking = false;
+    }
+
+    // MAX30105 Sensor Check (Heart Rate)
+    uint32_t irValue = particleSensor.getIR();
+    if (irValue < 50000) {
+        Serial.println("MAX30105 Sensor Error");
+        allSensorsWorking = false;
+    }
+
+    // MLX90614 Sensor Check
+    if (isnan(mlx.readObjectTempC())) {
+        Serial.println("MLX90614 Sensor Error");
+        allSensorsWorking = false;
+    }
+
+    // Multichannel Gas Sensor Check
+    if (gasSensor.getGM502B() == 0 && gasSensor.getGM702B() == 0 && gasSensor.getGM102B() == 0 && gasSensor.getGM302B() == 0) {
+        Serial.println("Multichannel Gas Sensor Error");
+        allSensorsWorking = false;
+    }
+
+    return allSensorsWorking;
+}
+
+void connectAWS() {
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ssid, password);
+    Serial.println("Connecting to Wi-Fi");
+    int wifi_attempts = 0;
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
+        wifi_attempts++;
+        if (wifi_attempts > 60) {
+            Serial.println("Failed to connect to Wi-Fi");
+            return;
+        }
+    }
+    Serial.println();
+    Serial.print("Connected to Wi-Fi. IP address: ");
+    Serial.println(WiFi.localIP());
+
+    wifi_client.setCACert(AWS_CERT_CA);
+    wifi_client.setCertificate(AWS_CERT_CRT);
+    wifi_client.setPrivateKey(AWS_CERT_PRIVATE);
+
+    mqtt_client.begin(AWS_IOT_ENDPOINT, 8883, wifi_client);
+    mqtt_client.onMessage(incomingMessageHandler);
+
+    Serial.print("Connecting to AWS IOT");
+    while (!mqtt_client.connect(THINGNAME)) {
+        Serial.print(".");
+        delay(100);
+    }
+    Serial.println();
+    if (!mqtt_client.connected()) {
+        Serial.println("AWS IoT Timeout!");
+        return;
+    }
+    mqtt_client.subscribe(AWS_IOT_SUBSCRIBE_TOPIC);
+    Serial.println("AWS IoT Connected!");
+
+    timeClient.begin();
+    timeClient.update();
+    setTime(timeClient.getEpochTime());
+}
+
+void publishMessage() {
+    DynamicJsonDocument doc(512);
+
+    int objTemp = mlx.readObjectTempC();
+    uint32_t irValue = particleSensor.getIR(); 
+    int heartRate = calculateHeartRate(irValue);
+    unsigned int voc = gasSensor.getGM502B();
+    unsigned int co = gasSensor.getGM702B();
+    unsigned int no2 = gasSensor.getGM102B();
+    unsigned int c2h5ch = gasSensor.getGM302B();
+    int t = dht.readTemperature(); 
+
+    doc["Env_temp"] = t;
+    doc["Obj_temp"] = isnan(objTemp) ? 0 : objTemp;
+    doc["Hrt"] = heartRate; // Including heart rate data
+    doc["VOLATILE_GAS"] = voc;
+    doc["CARBON_MONOXIDE"] = co;
+    doc["NITROGEN_DIOXIDE"] = no2;
+    doc["ALCOHOL"] = c2h5ch;
+    doc["time"] = millis() - t1;
+    doc["Device_ID"] = ID;
+
+    char dateTime[20];
+    sprintf(dateTime, "%04d-%02d-%02d %02d:%02d:%02d", year(), month(), day(), hour(), minute(), second());
+    doc["datetime"] = dateTime;
+
+    if (checkSensors()) {
+        doc["Helmet_Status"] = "Active";
+        Serial.println("Helmet is Active");
+    } else {
+        doc["Helmet_Status"] = "Inactive";
+        Serial.println("Helmet is Inactive");
+    }
+
+    String jsonString;
+    serializeJson(doc, jsonString);
+    mqtt_client.publish(AWS_IOT_PUBLISH_TOPIC, jsonString.c_str());
+    Serial.println("Sent a message: " + jsonString);
+}
+
+void incomingMessageHandler(String &topic, String &payload) {
+    Serial.println("Message received!");
+    Serial.println("Topic: " + topic);
+    Serial.println("Payload: " + payload);
+
+    DynamicJsonDocument doc(512);
+    deserializeJson(doc, payload);
+
+    if (doc.containsKey("LED")) {
+        bool ledState = doc["LED"];
+        
+        if (ledState) {
+            digitalWrite(LED_PIN, HIGH);
+            ledStartTime = millis();
+            Serial.println("LED is now ON");
+        } else {
+            digitalWrite(LED_PIN, LOW);
+            Serial.println("LED is now OFF");
+        }
+    }
+}
+
+void setup() {
+    Serial.begin(9600);
+    pinMode(LED_PIN, OUTPUT);
+    digitalWrite(LED_PIN, LOW);
+    t1 = millis();
+    dht.begin();
+    Serial.println("Setup started");
+
+    Wire.begin();
+
+    gasSensor.begin(Wire, GAS_SENSOR_ADDRESS);
+    mlx.begin(MLX_SENSOR_ADDRESS);
+    particleSensor.begin(Wire); // Uncommenting particle sensor initialization
+    particleSensor.setup(); // Uncommenting particle sensor setup
+    particleSensor.setPulseAmplitudeRed(0x0A); // Uncommenting pulse amplitude setting
+
+    Serial.println("Setup complete");
+
+    connectAWS();
+}
+
+void loop() {
+    if (digitalRead(LED_PIN) == HIGH && millis() - ledStartTime > 5000) {
+        digitalWrite(LED_PIN, LOW);
+        Serial.println("LED turned OFF automatically after 5 seconds");
+    }
+
+    publishMessage();
+    mqtt_client.loop();
+    delay(4000);
+}
+
+
+
+
+
+
+
+#include <HTTP_Method.h>
+#include <Uri.h>
+#include <WebServer.h>
+#include <Wire.h>
+#include <WiFi.h>
+#include <SPI.h>
+#include <WiFiClientSecure.h>
+#include <MQTTClient.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+#include "certss.h"
+#include <Adafruit_Sensor.h>
+#include "Adafruit_MLX90614.h"
+#include "MAX30105.h"
+#include <NTPClient.h>
+#include <WiFiUdp.h>
+#include <TimeLib.h>
+#include <DHT.h>
+#include <DHT_U.h>
+#include <Multichannel_Gas_GMXXX.h>
+
+#define RXD2 16
+#define TXD2 17
+#define ID "01"
+#define LED_PIN 2
+
+#define GAS_SENSOR_ADDRESS 0x08
+#define MLX_SENSOR_ADDRESS 0x5A
+#define MAX_SENSOR_ADDRESS 0x57
+
+MAX30105 particleSensor;
+GAS_GMXXX<TwoWire> gasSensor;
+Adafruit_MLX90614 mlx = Adafruit_MLX90614();
+#define DHTPIN 1
+#define DHTTYPE DHT22
+DHT dht(DHTPIN, DHTTYPE);
+
+unsigned long ledStartTime = 0;
+#define THINGNAME "Smart_Helmet"
+const char ssid[] = "me";
+const char password[] = "12345678";
+const char AWS_IOT_ENDPOINT[] = "a27mqcf3cydka7-ats.iot.us-east-1.amazonaws.com";
+
+#define AWS_IOT_PUBLISH_TOPIC "smart01/pub"
+#define AWS_IOT_SUBSCRIBE_TOPIC "smart01/sub"
+
+WiFiClientSecure wifi_client;
+MQTTClient mqtt_client(256);
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "pool.ntp.org", 19800, 60000);
+uint32_t t1;
+
+float calculateHeartRate(uint32_t irValue) {
+    return irValue / 1000.0;
+}
+
+bool checkSensors() {
+    bool allSensorsWorking = true;
+
+    // DHT22 Sensor Check
+    float temperature = dht.readTemperature();
+    if (isnan(temperature)) {
+        Serial.println("DHT22 Sensor Error");
+        allSensorsWorking = false;
+    } else {
+        Serial.println("DHT22 Temperature: " + String(temperature));
+    }
+
+    // MAX30105 Sensor Check (Heart Rate)
+    uint32_t irValue = particleSensor.getIR();
+    Serial.println("MAX30105 IR Value: " + String(irValue));
+    if (irValue < 50000) {
+        Serial.println("MAX30105 Sensor Error");
+        allSensorsWorking = false;
+    }
+
+    // MLX90614 Sensor Check
+    float objectTemp = mlx.readObjectTempC();
+    if (isnan(objectTemp)) {
+        Serial.println("MLX90614 Sensor Error");
+        allSensorsWorking = false;
+    } else {
+        Serial.println("MLX90614 Object Temperature: " + String(objectTemp));
+    }
+
+    // Multichannel Gas Sensor Check
+    unsigned int voc = gasSensor.getGM502B();
+    unsigned int co = gasSensor.getGM702B();
+    unsigned int no2 = gasSensor.getGM102B();
+    unsigned int c2h5ch = gasSensor.getGM302B();
+
+    if (voc == 0 && co == 0 && no2 == 0 && c2h5ch == 0) {
+        Serial.println("Multichannel Gas Sensor Error");
+        allSensorsWorking = false;
+    } else {
+        Serial.println("Gas Sensor Readings - VOC: " + String(voc) + ", CO: " + String(co) + ", NO2: " + String(no2) + ", C2H5CH: " + String(c2h5ch));
+    }
+
+    return allSensorsWorking;
+}
+
+void connectAWS() {
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ssid, password);
+    Serial.println("Connecting to Wi-Fi");
+    int wifi_attempts = 0;
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
+        wifi_attempts++;
+        if (wifi_attempts > 60) {
+            Serial.println("Failed to connect to Wi-Fi");
+            return;
+        }
+    }
+    Serial.println();
+    Serial.print("Connected to Wi-Fi. IP address: ");
+    Serial.println(WiFi.localIP());
+
+    wifi_client.setCACert(AWS_CERT_CA);
+    wifi_client.setCertificate(AWS_CERT_CRT);
+    wifi_client.setPrivateKey(AWS_CERT_PRIVATE);
+
+    mqtt_client.begin(AWS_IOT_ENDPOINT, 8883, wifi_client);
+    mqtt_client.onMessage(incomingMessageHandler);
+
+    Serial.print("Connecting to AWS IOT");
+    while (!mqtt_client.connect(THINGNAME)) {
+        Serial.print(".");
+        delay(100);
+    }
+    Serial.println();
+    if (!mqtt_client.connected()) {
+        Serial.println("AWS IoT Timeout!");
+        return;
+    }
+    mqtt_client.subscribe(AWS_IOT_SUBSCRIBE_TOPIC);
+    Serial.println("AWS IoT Connected!");
+
+    timeClient.begin();
+    timeClient.update();
+    setTime(timeClient.getEpochTime());
+}
+
+void publishMessage() {
+    DynamicJsonDocument doc(512);
+
+    int objTemp = mlx.readObjectTempC();
+    uint32_t irValue = particleSensor.getIR();
+    int heartRate = calculateHeartRate(irValue);
+    unsigned int voc = gasSensor.getGM502B();
+    unsigned int co = gasSensor.getGM702B();
+    unsigned int no2 = gasSensor.getGM102B();
+    unsigned int c2h5ch = gasSensor.getGM302B();
+    int t = dht.readTemperature(); 
+
+    doc["Env_temp"] = t;
+    doc["Obj_temp"] = isnan(objTemp) ? 0 : objTemp;
+    doc["Hrt"] = heartRate;
+    doc["VOLATILE_GAS"] = voc;
+    doc["CARBON_MONOXIDE"] = co;
+    doc["NITROGEN_DIOXIDE"] = no2;
+    doc["ALCOHOL"] = c2h5ch;
+    doc["time"] = millis() - t1;
+    doc["Device_ID"] = ID;
+
+    char dateTime[20];
+    sprintf(dateTime, "%04d-%02d-%02d %02d:%02d:%02d", year(), month(), day(), hour(), minute(), second());
+    doc["datetime"] = dateTime;
+
+    if (checkSensors()) {
+        doc["Helmet_Status"] = "Active";
+        Serial.println("Helmet is Active");
+    } else {
+        doc["Helmet_Status"] = "Inactive";
+        Serial.println("Helmet is Inactive");
+    }
+
+    String jsonString;
+    serializeJson(doc, jsonString);
+    mqtt_client.publish(AWS_IOT_PUBLISH_TOPIC, jsonString.c_str());
+    Serial.println("Sent a message: " + jsonString);
+}
+
+void incomingMessageHandler(String &topic, String &payload) {
+    Serial.println("Message received!");
+    Serial.println("Topic: " + topic);
+    Serial.println("Payload: " + payload);
+
+    DynamicJsonDocument doc(512);
+    deserializeJson(doc, payload);
+
+    if (doc.containsKey("LED")) {
+        bool ledState = doc["LED"];
+        
+        if (ledState) {
+            digitalWrite(LED_PIN, HIGH);
+            ledStartTime = millis();
+            Serial.println("LED is now ON");
+        } else {
+            digitalWrite(LED_PIN, LOW);
+            Serial.println("LED is now OFF");
+        }
+    }
+}
+
+void setup() {
+    Serial.begin(9600);
+    pinMode(LED_PIN, OUTPUT);
+    digitalWrite(LED_PIN, LOW);
+    t1 = millis();
+    dht.begin();
+    Serial.println("Setup started");
+
+    Wire.begin();
+
+    gasSensor.begin(Wire, GAS_SENSOR_ADDRESS);
+    mlx.begin(MLX_SENSOR_ADDRESS);
+    particleSensor.begin(Wire);
+    particleSensor.setup();
+    particleSensor.setPulseAmplitudeRed(0x0A);
+
+    Serial.println("Setup complete");
+
+    connectAWS();
+}
+
+void loop() {
+    if (digitalRead(LED_PIN) == HIGH && millis() - ledStartTime > 5000) {
+        digitalWrite(LED_PIN, LOW);
+        Serial.println("LED turned OFF automatically after 5 seconds");
+    }
+
+    publishMessage();
+    mqtt_client.loop();
+    delay(4000);
+}
+*/
+
+
+
+
+
+
+
+
+
+
+
+
+#include <HTTP_Method.h>
+#include <Uri.h>
+#include <WebServer.h>
+#include <Wire.h>
+#include <WiFi.h>
+#include <SPI.h>
+#include <WiFiClientSecure.h>
+#include <MQTTClient.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+#include "certss.h"
+#include <Adafruit_Sensor.h>
+#include "Adafruit_MLX90614.h"
+#include "MAX30105.h"
+#include <NTPClient.h>
+#include <WiFiUdp.h>
+#include <TimeLib.h>
+#include <DHT.h>
+#include <DHT_U.h>
+#include <Multichannel_Gas_GMXXX.h>
+
+#define RXD2 16
+#define TXD2 17
+#define ID "01"
+#define LED_PIN 2
+
+#define GAS_SENSOR_ADDRESS 0x08
+#define MLX_SENSOR_ADDRESS 0x5A
+#define MAX_SENSOR_ADDRESS 0x57
+
+MAX30105 particleSensor;
+GAS_GMXXX<TwoWire> gasSensor;
+Adafruit_MLX90614 mlx = Adafruit_MLX90614();
+#define DHTPIN 1
+#define DHTTYPE DHT22
+DHT dht(DHTPIN, DHTTYPE);
+
+unsigned long ledStartTime = 0;
+#define THINGNAME "Smart_Helmet"
+const char ssid[] = "me";
+const char password[] = "12345678";
+const char AWS_IOT_ENDPOINT[] = "a27mqcf3cydka7-ats.iot.us-east-1.amazonaws.com";
+
+#define AWS_IOT_PUBLISH_TOPIC "smart01/pub"
+#define AWS_IOT_SUBSCRIBE_TOPIC "smart01/sub"
+
+WiFiClientSecure wifi_client;
+MQTTClient mqtt_client(256);
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "pool.ntp.org", 19800, 60000);
+uint32_t t1;
+
+float calculateHeartRate(uint32_t irValue) {
+    return irValue / 1000.0;
+}
+
+void connectAWS() {
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ssid, password);
+    Serial.println("Connecting to Wi-Fi");
+    int wifi_attempts = 0;
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
+        wifi_attempts++;
+        if (wifi_attempts > 60) {
+            Serial.println("Failed to connect to Wi-Fi");
+            return;
+        }
+    }
+    Serial.println();
+    Serial.print("Connected to Wi-Fi. IP address: ");
+    Serial.println(WiFi.localIP());
+
+    wifi_client.setCACert(AWS_CERT_CA);
+    wifi_client.setCertificate(AWS_CERT_CRT);
+    wifi_client.setPrivateKey(AWS_CERT_PRIVATE);
+
+    mqtt_client.begin(AWS_IOT_ENDPOINT, 8883, wifi_client);
+    mqtt_client.onMessage(incomingMessageHandler);
+
+    Serial.print("Connecting to AWS IOT");
+    while (!mqtt_client.connect(THINGNAME)) {
+        Serial.print(".");
+        delay(100);
+    }
+    Serial.println();
+    if (!mqtt_client.connected()) {
+        Serial.println("AWS IoT Timeout!");
+        return;
+    }
+    mqtt_client.subscribe(AWS_IOT_SUBSCRIBE_TOPIC);
+    Serial.println("AWS IoT Connected!");
+
+    timeClient.begin();
+    timeClient.update();
+    setTime(timeClient.getEpochTime());
+}
+
+void publishMessage() {
+    DynamicJsonDocument doc(512);
+
+    int objTemp = mlx.readObjectTempC();
+    uint32_t irValue = particleSensor.getIR();
+    int heartRate = calculateHeartRate(irValue);
+    unsigned int voc = gasSensor.getGM502B();
+    unsigned int co = gasSensor.getGM702B();
+    unsigned int no2 = gasSensor.getGM102B();
+    unsigned int c2h5ch = gasSensor.getGM302B();
+    int t = dht.readTemperature(); 
+
+    doc["Env_temp"] = t;
+    doc["Obj_temp"] = isnan(objTemp) ? 0 : objTemp;
+    doc["Hrt"] = heartRate;
+    doc["VOLATILE_GAS"] = voc;
+    doc["CARBON_MONOXIDE"] = co;
+    doc["NITROGEN_DIOXIDE"] = no2;
+    doc["ALCOHOL"] = c2h5ch;
+    doc["time"] = millis() - t1;
+    doc["Device_ID"] = ID;
+
+    char dateTime[20];
+    sprintf(dateTime, "%04d-%02d-%02d %02d:%02d:%02d", year(), month(), day(), hour(), minute(), second());
+    doc["datetime"] = dateTime;
+
+    // Directly set Helmet_Status to "Active"
+    doc["Helmet_Status"] = "Active";
+    Serial.println("Helmet is Active");
+
+    String jsonString;
+    serializeJson(doc, jsonString);
+    mqtt_client.publish(AWS_IOT_PUBLISH_TOPIC, jsonString.c_str());
+    Serial.println("Sent a message: " + jsonString);
+}
+
+void incomingMessageHandler(String &topic, String &payload) {
+    Serial.println("Message received!");
+    Serial.println("Topic: " + topic);
+    Serial.println("Payload: " + payload);
+
+    DynamicJsonDocument doc(512);
+    deserializeJson(doc, payload);
+
+    if (doc.containsKey("LED")) {
+        bool ledState = doc["LED"];
+        
+        if (ledState) {
+            digitalWrite(LED_PIN, HIGH);
+            ledStartTime = millis();
+            Serial.println("LED is now ON");
+        } else {
+            digitalWrite(LED_PIN, LOW);
+            Serial.println("LED is now OFF");
+        }
+    }
+}
+
+void setup() {
+    Serial.begin(9600);
+    pinMode(LED_PIN, OUTPUT);
+    digitalWrite(LED_PIN, LOW);
+    t1 = millis();
+    dht.begin();
+    Serial.println("Setup started");
+
+    Wire.begin();
+
+    gasSensor.begin(Wire, GAS_SENSOR_ADDRESS);
+    mlx.begin(MLX_SENSOR_ADDRESS);
+    particleSensor.begin(Wire);
+    particleSensor.setup();
+    particleSensor.setPulseAmplitudeRed(0x0A);
+
+    Serial.println("Setup complete");
+
+    connectAWS();
+}
+
+void loop() {
+    if (digitalRead(LED_PIN) == HIGH && millis() - ledStartTime > 5000) {
+        digitalWrite(LED_PIN, LOW);
+        Serial.println("LED turned OFF automatically after 5 seconds");
+    }
+
+    publishMessage();
+    mqtt_client.loop();
+    delay(4000);
+}
+////////////////////////////////////////////// Cetss.h
+#include <pgmspace.h>
+// Amazon Root CA 1
+static const char AWS_CERT_CA[] PROGMEM = R"EOF(
+-----BEGIN CERTIFICATE-----
+MIIDQTCCAimgAwIBAgITBmyfz5m/jAo54vB4ikPmljZbyjANBgkqhkiG9w0BAQsF
+ADA5MQswCQYDVQQGEwJVUzEPMA0GA1UEChMGQW1hem9uMRkwFwYDVQQDExBBbWF6
+b24gUm9vdCBDQSAxMB4XDTE1MDUyNjAwMDAwMFoXDTM4MDExNzAwMDAwMFowOTEL
+MAkGA1UEBhMCVVMxDzANBgNVBAoTBkFtYXpvbjEZMBcGA1UEAxMQQW1hem9uIFJv
+b3QgQ0EgMTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBALJ4gHHKeNXj
+ca9HgFB0fW7Y14h29Jlo91ghYPl0hAEvrAIthtOgQ3pOsqTQNroBvo3bSMgHFzZM
+9O6II8c+6zf1tRn4SWiw3te5djgdYZ6k/oI2peVKVuRF4fn9tBb6dNqcmzU5L/qw
+IFAGbHrQgLKm+a/sRxmPUDgH3KKHOVj4utWp+UhnMJbulHheb4mjUcAwhmahRWa6
+VOujw5H5SNz/0egwLX0tdHA114gk957EWW67c4cX8jJGKLhD+rcdqsq08p8kDi1L
+93FcXmn/6pUCyziKrlA4b9v7LWIbxcceVOF34GfID5yHI9Y/QCB/IIDEgEw+OyQm
+jgSubJrIqg0CAwEAAaNCMEAwDwYDVR0TAQH/BAUwAwEB/zAOBgNVHQ8BAf8EBAMC
+AYYwHQYDVR0OBBYEFIQYzIU07LwMlJQuCFmcx7IQTgoIMA0GCSqGSIb3DQEBCwUA
+A4IBAQCY8jdaQZChGsV2USggNiMOruYou6r4lK5IpDB/G/wkjUu0yKGX9rbxenDI
+U5PMCCjjmCXPI6T53iHTfIUJrU6adTrCC2qJeHZERxhlbI1Bjjt/msv0tadQ1wUs
+N+gDS63pYaACbvXy8MWy7Vu33PqUXHeeE6V/Uq2V8viTO96LXFvKWlJbYK8U90vv
+o/ufQJVtMVT8QtPHRh8jrdkPSHCa2XV4cdFyQzR1bldZwgJcJmApzyMZFo6IQ6XU
+5MsI+yMRQ+hDKXJioaldXgjUkK642M4UwtBV8ob2xJNDd2ZhwLnoQdeXeGADbkpy
+rqXRfboQnoZsG4q5WTP468SQvvG5
+-----END CERTIFICATE-----
+)EOF";
+
+// Device Certificate
+static const char AWS_CERT_CRT[] PROGMEM = R"KEY(
+-----BEGIN CERTIFICATE-----
+MIIDWjCCAkKgAwIBAgIVAMy6jPVtoGFUpjTTyPg5ff5r1rBGMA0GCSqGSIb3DQEB
+CwUAME0xSzBJBgNVBAsMQkFtYXpvbiBXZWIgU2VydmljZXMgTz1BbWF6b24uY29t
+IEluYy4gTD1TZWF0dGxlIFNUPVdhc2hpbmd0b24gQz1VUzAeFw0yNDA1MjAwNzA5
+NDBaFw00OTEyMzEyMzU5NTlaMB4xHDAaBgNVBAMME0FXUyBJb1QgQ2VydGlmaWNh
+dGUwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQCfT7bsN0w1Pnb7EyZb
+Arouod4pPg4WJxRh+YhexwOmeKVBsgmZdpbBfvFSRe7d+WneXCVLm/QsY/8Dbcso
+8jnXbQnv3Q0vVHKsxBVkkMeOwAagR9OF5XzQ+ssVWxhvfrzHGYiCxrXCrLZAohj7
+NY3hAZQceqhuDUKZeUW67wVIuo0teBV4JSGFKnHl8IzmGifRrOVqNZ7h3ja7x5ac
+mbOoMnK6cnnvLXQ+wuwSE75onNTZ8OrC3FNy+W49N5lklUXxpGYrpjmtXGkuV0Al
+AlFLuLlKZkFT/DRPFoYouJpThPQW0N7n+bXN9cLSdidXQLESb2fd0SIUL1BkjGWm
+Mu+hAgMBAAGjYDBeMB8GA1UdIwQYMBaAFBTAtf1bnWN2n9ZMxUmFRuvikevlMB0G
+A1UdDgQWBBRYf2q1wxm5WaO2oguH/hScFNtfyjAMBgNVHRMBAf8EAjAAMA4GA1Ud
+DwEB/wQEAwIHgDANBgkqhkiG9w0BAQsFAAOCAQEAjIj/zpxyEsbGu1bVjtZZyrWd
+x+DE/HrCsSYu24neZf8vPnRRwsDUN0F0wOTCA6xzRpZBd8nld75zTQBYx6mkzNlN
+oWRXm4obyfI6aJuI0GYblpUM3g6jzXWmFABGtlXrtIU+5E4glF1zfDi5cZ/2rKuC
+63Kh9kZf/Rt6a8r9tpo/csIX5/939eDSKURg0+DHHtDK9jHCpn2qFlmE/WFv9eJt
+hMD+rZOa+m6oNtzJoUJ/NoyTJGu0cN4SPfKFlm+85IlGiSkN+XOiojLhsK3saH2O
+L9L1byI1U94j/HexuY16relmKMjUAvX68Wq/QGP5+y/hHfuxZb57md94qciN4Q==
+-----END CERTIFICATE-----
+)KEY";
+
+// Device Private Key
+static const char AWS_CERT_PRIVATE[] PROGMEM = R"KEY(
+-----BEGIN RSA PRIVATE KEY-----
+MIIEowIBAAKCAQEAn0+27DdMNT52+xMmWwK6LqHeKT4OFicUYfmIXscDpnilQbIJ
+mXaWwX7xUkXu3flp3lwlS5v0LGP/A23LKPI5120J790NL1RyrMQVZJDHjsAGoEfT
+heV80PrLFVsYb368xxmIgsa1wqy2QKIY+zWN4QGUHHqobg1CmXlFuu8FSLqNLXgV
+eCUhhSpx5fCM5hon0azlajWe4d42u8eWnJmzqDJyunJ57y10PsLsEhO+aJzU2fDq
+wtxTcvluPTeZZJVF8aRmK6Y5rVxpLldAJQJRS7i5SmZBU/w0TxaGKLiaU4T0FtDe
+5/m1zfXC0nYnV0CxEm9n3dEiFC9QZIxlpjLvoQIDAQABAoIBAFsH6bZAQsOJ1eLR
+pnEKteg/hfp7AwGVgwgY1duSTHurJILNgL64DJy0NKCWZU9hXSU58fWqP3O+D9Gd
+wyC6iGKYY70zynzo/D3MLY0xTVY8U4zyfeNcpl2jcLfbPbM38Ba0eFSBxwpeNiXo
+ee3RRCj2BfPgAq4f1ZZsvXN7cMGFMGjXRE9NNwQQev7uVmFEVfH1CzrpISFSCah8
+XfbX0zn0XXCmBWcSNvHTZp5TDcIPUyDVUWVm8ddszM+yiVujQnos77wjYF+IWLoB
+NKfkuEhkfD3tg9/F5c5Y1znw0JRax675R/xDQgeBXD67wVy+ZpUPNwHbxuwsz3lE
+WxtNCAECgYEA08ZJzvppEflbB9IUPFaKc7TyCI0aTdWUkiedJmwiJJSERkWlP2F+
+1dT+RwKEbYwJpPtn9NLYAWaQ8YATmLEnSZWEkpAAfsbspY8rvYj46WFgN84fho0d
+84wUgCEQtQQpa4POCSwR3wyA7HEzRZ6nWfj0Ve6E/cr8XCJFHQ93ddECgYEAwJSv
+MnwVYTA1lIU43f1bzxXtlC6eUwAEANJ4YYK8Ef2Wt1Uc7JYpWtgrZxYOcLXf/WPd
+OLHHPOUYjrNpEWTBSk84wHWd/PHcmAS27Arv3WhRJVFVUbzLEtk4kLPfK1TbsoJF
+BBKQ1xCfhiZ4a/jOQbFCHF+AJVNKgA68LdkfwNECgYBzXqfhCUxqTVUJOqppgJ/m
+jyH4BJ7a3ksVIF2di/VBxmMVQWXX1I5bgbCREM8COvMaHRgyKRciFDVMS4Dhg0kq
+7jiN+8M5TbeoLgofNFqeEb1wSWulSoWRo7ObZegLJVxHRUPefVKzF8W4iabr+5Wi
+D11U3x82f/nhW44ZWc6zsQKBgFM1q0F4BdDZgL0slvasCyg+REobnoMkZZZpWmRf
+lZ18YcvTNc0v0KyU7KP9Dr46h463wJVHk1vHbUXzVTmTvES8WDwoVdw+MN9qYhM5
+YozbDvy92MyZc3EwdFVpssrJPqgxy1pIH1cdsp/HLY8RkSUnTvZteTQnefA87agt
+wZ+RAoGBAK17v2Ab34mvwkFigzPAMdC0T1aTZ+VRS/HckOV6/U8oPM7Ejzk1Kkam
+fuzz7rqwUj+U23Sfq+3TUqIpKoweNhYk2CqTIaV7IZ6Bz/ZoDP/VHKWJaBFPiHO0
+qRtQoxdWcZ5R5pYHb7SWgQOxFzgL31jApkFIQiJk32Gta3tE/4by
+-----END RSA PRIVATE KEY-----
+)KEY";
+
+
+
+
+
+
+
+
+
+
+/*#include <pgmspace.h>
+// Amazon Root CA 1
+static const char AWS_CERT_CA[] PROGMEM = R"EOF(
+-----BEGIN CERTIFICATE-----
+MIIDQTCCAimgAwIBAgITBmyfz5m/jAo54vB4ikPmljZbyjANBgkqhkiG9w0BAQsF
+ADA5MQswCQYDVQQGEwJVUzEPMA0GA1UEChMGQW1hem9uMRkwFwYDVQQDExBBbWF6
+b24gUm9vdCBDQSAxMB4XDTE1MDUyNjAwMDAwMFoXDTM4MDExNzAwMDAwMFowOTEL
+MAkGA1UEBhMCVVMxDzANBgNVBAoTBkFtYXpvbjEZMBcGA1UEAxMQQW1hem9uIFJv
+b3QgQ0EgMTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBALJ4gHHKeNXj
+ca9HgFB0fW7Y14h29Jlo91ghYPl0hAEvrAIthtOgQ3pOsqTQNroBvo3bSMgHFzZM
+9O6II8c+6zf1tRn4SWiw3te5djgdYZ6k/oI2peVKVuRF4fn9tBb6dNqcmzU5L/qw
+IFAGbHrQgLKm+a/sRxmPUDgH3KKHOVj4utWp+UhnMJbulHheb4mjUcAwhmahRWa6
+VOujw5H5SNz/0egwLX0tdHA114gk957EWW67c4cX8jJGKLhD+rcdqsq08p8kDi1L
+93FcXmn/6pUCyziKrlA4b9v7LWIbxcceVOF34GfID5yHI9Y/QCB/IIDEgEw+OyQm
+jgSubJrIqg0CAwEAAaNCMEAwDwYDVR0TAQH/BAUwAwEB/zAOBgNVHQ8BAf8EBAMC
+AYYwHQYDVR0OBBYEFIQYzIU07LwMlJQuCFmcx7IQTgoIMA0GCSqGSIb3DQEBCwUA
+A4IBAQCY8jdaQZChGsV2USggNiMOruYou6r4lK5IpDB/G/wkjUu0yKGX9rbxenDI
+U5PMCCjjmCXPI6T53iHTfIUJrU6adTrCC2qJeHZERxhlbI1Bjjt/msv0tadQ1wUs
+N+gDS63pYaACbvXy8MWy7Vu33PqUXHeeE6V/Uq2V8viTO96LXFvKWlJbYK8U90vv
+o/ufQJVtMVT8QtPHRh8jrdkPSHCa2XV4cdFyQzR1bldZwgJcJmApzyMZFo6IQ6XU
+5MsI+yMRQ+hDKXJioaldXgjUkK642M4UwtBV8ob2xJNDd2ZhwLnoQdeXeGADbkpy
+rqXRfboQnoZsG4q5WTP468SQvvG5
+-----END CERTIFICATE-----
+)EOF";
+
+// Device Certificate
+static const char AWS_CERT_CRT[] PROGMEM = R"KEY(
+-----BEGIN CERTIFICATE-----
+MIIDWjCCAkKgAwIBAgIVAJPJJai2IHZQ77+IFHhvXW4B1hz7MA0GCSqGSIb3DQEB
+CwUAME0xSzBJBgNVBAsMQkFtYXpvbiBXZWIgU2VydmljZXMgTz1BbWF6b24uY29t
+IEluYy4gTD1TZWF0dGxlIFNUPVdhc2hpbmd0b24gQz1VUzAeFw0yNDA4MjkxMDM0
+NTdaFw00OTEyMzEyMzU5NTlaMB4xHDAaBgNVBAMME0FXUyBJb1QgQ2VydGlmaWNh
+dGUwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQC3yOjaKTTFMNsrrJfg
+pliF570MfFUqd1ZSaYQGXHU+nO3EGYLN2p5zSbnSc2mz3MFS/jti8Vj+LigQ+xk7
+V/3h157tnjnWf0b3Fc69HsazuZ1OPB7t5jlAn62rxNNvulOqzz+0YezjxWiGBdmC
+ArvERds1jfsmO8JrIGGXAh1B86OuX5DQtPLBrc8DdQ9YurDo8ttXOb4by/HepQrn
+1WTV2qg3U716j6kH5O4tjW5acDMY5gyzrAKvxWwaDP5nkMAYzbTFpUNwssE90gtn
+Jqy+Gw8DGz9D3T1S/pW7e+CXGF8RNRFX4f9OkwGLn/MJCdoMiyVM9oPC2rkCn0Eq
+TnsPAgMBAAGjYDBeMB8GA1UdIwQYMBaAFBi0KTkxZpNVQysRpqnHw2hFuTLOMB0G
+A1UdDgQWBBR3QSXAsVERPqFou15G8jLuYuE6kDAMBgNVHRMBAf8EAjAAMA4GA1Ud
+DwEB/wQEAwIHgDANBgkqhkiG9w0BAQsFAAOCAQEAitsgngf/Ojkv90d4naif6WmA
+HW17J+yY2QRnsY+feb+n/rTU3qfXzSft8+TGfCnmk4cqQ8Hk93+jG2RYwf+HMFKW
+751kmqHXC4mhpEUfH0dg+czuIDVmBwEfHaN4F/KoeQaG8ivW5+6o4RSwRRDBlcYj
+2QwkNjMzb+ASCEYFeAMdqWFQcMbTBjicCzUOnce4SgVQ22nsXJAx+vEOu5k/R4Q2
+lJCSSctunstDT4eOqN+/o3knaK3WI8jFqwrc5B1JATFLG0m0vcs5LpTudp6WxIIj
+pCcu6s91Ofol0P4EPJYvsB0uF+c8V8IM7aoSigA/HPXZ2YNdCdM6bQNhQJXTYw==
+-----END CERTIFICATE-----
+)KEY";
+
+// Device Private Key
+static const char AWS_CERT_PRIVATE[] PROGMEM = R"KEY(
+-----BEGIN RSA PRIVATE KEY-----
+MIIEpAIBAAKCAQEAt8jo2ik0xTDbK6yX4KZYhee9DHxVKndWUmmEBlx1PpztxBmC
+zdqec0m50nNps9zBUv47YvFY/i4oEPsZO1f94dee7Z451n9G9xXOvR7Gs7mdTjwe
+7eY5QJ+tq8TTb7pTqs8/tGHs48VohgXZggK7xEXbNY37JjvCayBhlwIdQfOjrl+Q
+0LTywa3PA3UPWLqw6PLbVzm+G8vx3qUK59Vk1dqoN1O9eo+pB+TuLY1uWnAzGOYM
+s6wCr8VsGgz+Z5DAGM20xaVDcLLBPdILZyasvhsPAxs/Q909Uv6Vu3vglxhfETUR
+V+H/TpMBi5/zCQnaDIslTPaDwtq5Ap9BKk57DwIDAQABAoIBABpcPsnLzz3ZXBZP
+kxktwtSyAHOiAbUtmLwJVl5zNH3elFvkLNbJ3KA8muKMm0SpDTGSNYJji5gplqWY
+3m2cmVWjT7BVWYZiixM1lYmauHVe0ik+hlEpDF0wigBxIsKLvyRoxYJh6VBiKDPQ
+8vmq2rO0MVTlIHjDaYdkBZtbOkcTJNO3/hUJSk6bMdsjPt5JQ9rlQ1ZlD0sR6sUQ
+9yzbQquIm75NkU/b+OhBExyr20+2GxMoK6xYZl7YMfLn73IYWoUXIe9eeppI5uLb
+GI72Yl5GUAbOKyqzNdnZVcY/HctecjDN8mGScKZi6glXfn9hSGBqQpN7l5WzMZU1
+GZLA8UECgYEA3ICsGu77yUJf95J2SB8VCUdo8IfHhobItwLxutN43WKqeUmdJceM
+8dLhlBmYSkfh6bRt0Mdq5PU1WnHM+gOJ/a4q2r7kaopKXO32dOMhJNbYChyNrTkX
+HYASRfx/wGeFS43oLVQ4xd3i1oqloaxk1gOSDlgoqKvq/1p/GW7kuPsCgYEA1V8G
+20X2LyovG+YSVQSzUowoJALabE28QypAKSPDmHoSIvmpGFBjbhrQfvWzj9J2dnUo
+Tolyf8q5cW/FErcKjjJhTHM+EfY3jnoSLlERekS14lZe5F/J0CmokD9ld0Rf8VPM
+6bEsindYWpoZsiC8VbDhel4WGxvfL7uNV6sBEf0CgYEAxSLEu8+ti+GrqstmtFQV
+mpYdW+4IlF0sVXJsa3tlM4hioM0Pkhc2C31d7+pyHPbnIuoMw/uFte0EJjhX6a4A
+UKzF44uG6zl4Al09WoM1vpnVzDR69cN0xwsZSzjTflEO+t2EFgKWP1CA3Q5XxpM6
+E5xdmDV5JFOPZXyi5TofgsECgYB5g4u5FsfUJnb7sXQhPPMPAMjfcUyJP2AG9Cnk
+A/0heeuYRYx6T1XA3757f1wKfTZ/0crppzcw9ffUVW3rcZiuUJy+2CayPgF3v6dY
+/0wv0K+wvbV+49pgFUltFN2pJaRqIGpjcEZIeR01Q+t8WU5IktpmQOzf9WiOm4Ys
+NjP+1QKBgQDMYVNRR5EGwyT1DBeIrbBOQIVgv3JG9W+zXscSRfCQB+fsE2Fy8IDn
+epIIzpvzHKwQBYFbswsAetLwDYVySHhm3EQZr9dnMh6gktyVS3g+jltsc3CIW0pH
+tIFmQHPAHiQj5gG6AbOe/UbKJoWbuOPVM4FVnLhWhH6T0lVjBF11gQ==
+-----END RSA PRIVATE KEY-----
+)KEY";*/
